@@ -33,6 +33,8 @@
 > - vLLM Disagg Prefill + MTP (NixlConnector, MooncakeConnector, LMCacheConnectorV1)
 > - llm-d-kv-cache speculative indexing maturity (v0.6.0+ roadmap)
 > - lmdeploy TurboQuant + speculative decoding (currently blocked)
+> - Hardware compatibility updates (V100/RTX3080/RTX5090 benchmarks, FP8 KV support, NVFP4)
+> - Hardware compatibility updates (V100/RTX3080/RTX5090 benchmarks, FP8 KV support)
 >
 > **VERIFY BEFORE YOU WRITE. CITE EVERY CHANGE.**
 >
@@ -41,7 +43,7 @@
 # LLM Inference Engines: Status Report (May 2026)
 
 **Fokus:** KV Cache Quantisierung (FP8/FP4/Q4/Q5/Q8/TurboQuant) + Tensor Parallel (Strict TP) + Native MTP (Qwen3.6-27B)
-**Letzte Aktualisierung:** 2026-05-19
+**Letzte Aktualisierung:** 2026-05-20
 
 ---
 
@@ -52,7 +54,8 @@
 | **FP8 KV Cache** | ✅ Production | `--kv-cache-dtype fp8` (e4m3/e5m2). Per-tensor & per-attention-head via llm-compressor. | [vLLM Docs](https://docs.vllm.ai/en/latest/features/quantization/quantized_kvcache/), [PR #30141](https://github.com/vllm-project/vllm/pull/30141), [Blog Apr 2026](https://vllm.ai/blog/2026-04-22-fp8-kvcache) |
 | **FP4 KV Cache** | ❌ | Nicht implementiert | — |
 | **Q4/Q5/Q8 Integer KV** | ❌ | Keine Integer KV Cache Quantisierung | — |
-| **TurboQuant KV** | ⚠️ **Nur mit Genesis-Patches** | `--kv-cache-dtype turboquant_3bit_nc` (TQ3, 3-bit). Upstream PRs #38280/#38662 geschlossen. **Ohne Genesis:** TQ + MTP = `!`-floods, first-word repetition (vllm#40880). **Mit Genesis v7.72.2:** ✅ Production (P67 TQ multi-query kernel + P64/P66/PN8/PN9/PN14/PN30/PN34). club-3090 validiert: 4 streams @ 262K, 53.65 narr / 72.93 code TPS, AL 3.41. | [PR #38280](https://github.com/vllm-project/vllm/pull/38280), [PR #38662](https://github.com/vllm-project/vllm/pull/38662), [Issue #40880](https://github.com/vllm-project/vllm/issues/40880), [Genesis](https://github.com/Sandermage/genesis-vllm-patches), [club-3090/turbo.yml](https://github.com/noonghunna/club-3090/blob/master/models/qwen3.6-27b/vllm/compose/dual/turbo.yml), [club-3090/tq3-mtp.yml (TOMBSTONED)](https://github.com/noonghunna/club-3090/blob/master/models/qwen3.6-27b/vllm/compose/dual/tq3-mtp.yml) |
+| **TurboQuant KV (dense)** | ✅ Production | `--kv-cache-dtype turboquant_3bit_nc` (TQ3, 3-bit). PR #38479 (15.04.2026) nativ in vLLM. **Ohne Genesis:** Funktioniert für GQA/MHA-Modelle (Llama, Mistral, Gemma). | [PR #38479](https://github.com/vllm-project/vllm/pull/38479) |
+| **TurboQuant KV (hybrid/Qwen3.6)** | ⚠️ **Genesis required** | Qwen3.6-27B (Hybrid: DeltaNet + Attention): `NotImplementedError` in `vllm/engine/arg_utils.py:1652`. **Mit Genesis v7.72.2:** ✅ Production (P67 TQ multi-query kernel + P64/P66/PN8/PN9/PN14/PN30/PN34). | [Genesis](https://github.com/Sandermage/genesis-vllm-patches), [club-3090/turbo.yml](https://github.com/noonghunna/club-3090/blob/master/models/qwen3.6-27b/vllm/compose/dual/turbo.yml) |
 | **Strict Tensor Parallel** | ✅ Production | `--tensor-parallel-size N`, multi-GPU/multi-node via Ray | [vLLM Docs](https://docs.vllm.ai/en/latest/serving/distributed_serving.html) |
 | **MTP (Qwen3.6)** | ✅ Production | `--speculative-config '{"method":"qwen3_next_mtp","num_speculative_tokens":2}'` | [Qwen3.6-27B HF Card](https://huggingface.co/Qwen/Qwen3.6-27B) |
 | **MTP + Prefix Cache Bug** | ⚠️ OPEN | MTP reduziert Prefix Cache Hit Rate von 92% auf 71% | [Issue #38182](https://github.com/vllm-project/vllm/issues/38182) |
@@ -67,6 +70,9 @@
 **Ohne Genesis:** TurboQuant + MTP auf vLLM ist **defekt** (Issue #40880). club-3090 tombstoned `tq3-mtp.yml` am 2026-05-11.
 
 **Mit Genesis v7.72.2:** TurboQuant + MTP + Strict TP ist **Production** (club-3090 `turbo.yml`: ✅ Production).
+- **Production-validiert:** `turboquant_k8v4` + MTP (k8v4, nicht 3bit_nc). 4 streams @ 262K, 53.65 narr / 72.93 code TPS, AL 3.41.
+- **TOMBSTONED:** `turboquant_3bit_nc` + MTP (tq3-mtp.yml). Issue #40880: "we did not test MTP at all in the v7.13 cycle... your data shows that assumption is wrong."
+- **Single-card OOM Bug:** >50K Tokens auf 24GB GPU → OOM trotz PN59-Fix (chunked-prefill Eligibility-Check). Workaround: dual.yml/dual-turbo.yml (TP=2) oder llama.cpp.
 
 **Kritische Genesis Patches für TQ3 + MTP:**
 | Patch | Funktion | Status |
@@ -83,13 +89,16 @@
 | **P5** | KV page-size unification for hybrid models | ✅ Required |
 
 **Open upstream PRs (Genesis-free Fix Gap):**
-| PR | Thema | Status |
-|----|-------|--------|
-| #40914 | Synthetic seq_lens K+1 routing | OPEN (negativ: `!`-floods, tool/multi-turn timeout) |
-| #40798 | TQ decode workspace pre-allocation | OPEN |
-| #42215 | TQ decode kernel warmup | OPEN |
-| #40792 | k8v4 GQA decode optimization | OPEN |
-| #40069 | Tracking issue (Spec-decode/Eagle disabled for TurboQuant) | OPEN |
+| PR | Thema | Status | Quelle |
+|----|-------|--------|--------|
+| #38479 | TurboQuant KV Cache (dense GQA/MHA) | MERGED | [PR #38479](https://github.com/vllm-project/vllm/pull/38479) |
+| #40914 | Synthetic seq_lens K+1 routing | OPEN (Fix for #40880, restores FULL cudagraph for spec-decode) | [PR](https://github.com/vllm-project/vllm/pull/40914) |
+| #40798 | TQ decode workspace pre-allocation | OPEN | [PR](https://github.com/vllm-project/vllm/pull/40798) |
+| #42215 | TQ decode kernel warmup | OPEN | [PR](https://github.com/vllm-project/vllm/pull/42215) |
+| #40792 | k8v4 GQA decode optimization | OPEN | [PR](https://github.com/vllm-project/vllm/pull/40792) |
+| #40069 | Tracking issue (Spec-decode/Eagle disabled for TurboQuant) | OPEN | [Issue](https://github.com/vllm-project/vllm/issues/40069) |
+
+**vLLM-eigener Benchmark (11.05.2026):** FP8 via `--kv-cache-dtype fp8` bleibt die beste Standardwahl für KV-Cache-Quantisierung: 2× Kapazität bei vernachlässigbaren Qualitätsverlusten. TurboQuant 3bit_nc und k3v4_nc zeigen bedeutende Qualitätsverluste und substanzielle Latenzverschlechterung.
 
 **Empfohlener Start (Qwen3.6-27B, 4× GPU, FP8):**
 ```bash
@@ -430,6 +439,7 @@ CUDA_VISIBLE_DEVICES=1 vllm serve Qwen/Qwen3.6-27B \
 | **kvtc** | [OnlyTerp/kvtc](https://github.com/OnlyTerp/kvtc) | First open-source KVTC (NVIDIA, ICLR 2026). 8-32× KV Cache Compression via PCA + adaptive quant + entropy coding. | ✅ | [Repo](https://github.com/OnlyTerp/kvtc) |
 | **turboquant_plus** | [TheTom/turboquant_plus](https://github.com/TheTom/turboquant_plus) | TurboQuant research & upstream PR plan | ✅ | [Repo](https://github.com/TheTom/turboquant_plus) |
 | **llama-cpp-turboquant** | [TheTom/llama-cpp-turboquant](https://github.com/TheTom/llama-cpp-turboquant) | TurboQuant für llama.cpp (Basis für buun/ik forks) | ✅ | [Repo](https://github.com/TheTom/llama-cpp-turboquant) |
+| **llama.cpp-turboq-mtp** | [Indras-Mirror/llama.cpp-turboq-mtp](https://github.com/Indras-Mirror/llama.cpp-turboq-mtp) | TBQ4 Fused Flash Attention + MTP + Shared Tensors. 82+ tok/s mit verlustfreiem 4.25 bpv KV-Cache bei 200K Kontext auf RTX 4090. TBQ4_0: 4.2 GB vs. 16.4 GB (upstream Q4_0) bei 262K. | ✅ Fork | [Repo](https://github.com/Indras-Mirror/llama.cpp-turboq-mtp) |
 
 ---
 
@@ -474,6 +484,7 @@ CUDA_VISIBLE_DEVICES=1 vllm serve Qwen/Qwen3.6-27B \
 
 | Engine | Issue/PR | Thema | Status | Quelle |
 |--------|----------|-------|--------|--------|
+| vLLM | #38479 | TurboQuant KV Cache (dense GQA/MHA) | MERGED | [PR](https://github.com/vllm-project/vllm/pull/38479) |
 | vLLM | #38182 | MTP + Prefix Cache Hit Rate Drop (92%→71%) | OPEN | [Issue](https://github.com/vllm-project/vllm/issues/38182) |
 | vLLM | #38280 | TurboQuant KV Cache | CLOSED | [PR](https://github.com/vllm-project/vllm/pull/38280) |
 | vLLM | #38662 | TurboQuant KV Cache (PolarQuant + QJL) | CLOSED | [PR](https://github.com/vllm-project/vllm/pull/38662) |
@@ -485,6 +496,7 @@ CUDA_VISIBLE_DEVICES=1 vllm serve Qwen/Qwen3.6-27B \
 | vLLM | #42215 | TQ decode kernel warmup | OPEN | [PR](https://github.com/vllm-project/vllm/pull/42215) |
 | vLLM | #40792 | k8v4 GQA decode optimization | OPEN | [PR](https://github.com/vllm-project/vllm/pull/40792) |
 | vLLM | #40391 | INT8 PTH KV (per-token-head) | MERGED | [PR](https://github.com/vllm-project/vllm/pull/40391) |
+| llama.cpp | #21089 | TurboQuant (tbq3_0, tbq4_0) | OPEN (aktiver Upstream-PR) | [TurboQuant Tools](https://turboquant-tools.com) |
 | llama.cpp | #20977 | TurboQuant Support Feature Request | OPEN (321 👍) | [Issue](https://github.com/ggml-org/llama.cpp/issues/20977) |
 | llama.cpp | #21131 | TurboQuant KV Cache (4.57× compression) | CLOSED | [PR](https://github.com/ggml-org/llama.cpp/pull/21131) |
 | llama.cpp | #21062 | TurboQuant KV Cache (2/3/4-bit) + CUDA | CLOSED | [PR](https://github.com/ggml-org/llama.cpp/pull/21062) |
@@ -493,6 +505,7 @@ CUDA_VISIBLE_DEVICES=1 vllm serve Qwen/Qwen3.6-27B \
 | llama.cpp | #5932 | 4-bit KV Cache Discussion | OPEN | [Discussion](https://github.com/ggml-org/llama.cpp/discussions/5932) |
 | llama.cpp | #19378 | Strict Tensor Parallel (split-mode tensor) | MERGED (Feb 2026) | [PR](https://github.com/ggml-org/llama.cpp/pull/19378) |
 | llama.cpp | #22673 | MTP Support | MERGED (May 2026) | [PR](https://github.com/ggml-org/llama.cpp/pull/22673) |
+| llama.cpp | #23230 | MTP speed regression nach PR #22673 final merge | OPEN (unconfirmed) | [Issue](https://github.com/ggml-org/llama.cpp/issues/23230) |
 | ik_llama | #1022 | Graph Tensor Parallel | MERGED | [PR](https://github.com/ikawrakow/ik_llama.cpp/pull/1022) |
 | ik_llama | #1698, #1745 | MTP for Qwen3.5/3.6 | MERGED | [PR #1698](https://github.com/ikawrakow/ik_llama.cpp/pull/1698), [PR #1745](https://github.com/ikawrakow/ik_llama.cpp/pull/1745) |
 | ik_llama | #627 | Feature Request: Tensor Parallelism | OPEN | [Issue](https://github.com/ikawrakow/ik_llama.cpp/issues/627) |
@@ -502,6 +515,7 @@ CUDA_VISIBLE_DEVICES=1 vllm serve Qwen/Qwen3.6-27B \
 ## 11. Quellen & Referenzen
 
 - **vLLM:** https://github.com/vllm-project/vllm, https://docs.vllm.ai, https://vllm.ai/blog/2026-04-22-fp8-kvcache
+- **vLLM Blog 11.05.2026:** https://vllm.ai/blog/2026-05-11-fp8-kvcache-benchmark — FP8 > TurboQuant für Throughput; TurboQuant 3bit_nc: substanzielle PPL-Verluste
 - **Genesis (Sandermage):** https://github.com/Sandermage/genesis-vllm-patches
 - **club-3090 (noonghunna):** https://github.com/noonghunna/club-3090 — Validated TQ3 + MTP + Genesis v7.72.2 on dual RTX 3090
 - **SGLang:** https://github.com/sgl-project/sglang, https://sgl-project.github.io/advanced_features/quantized_kv_cache.html
@@ -529,6 +543,192 @@ CUDA_VISIBLE_DEVICES=1 vllm serve Qwen/Qwen3.6-27B \
 - **KakeyaLattice:** https://github.com/FluffyAIcode/LLM-KV--Cache-compress
 - **lmdeploy TurboQuant:** https://github.com/InternLM/lmdeploy, [PR #4510](https://github.com/InternLM/lmdeploy/commit/e433925b61c84249b0edc5cb46bebc2dec71cb7f)
 - **RocketKV:** https://github.com/NVlabs/RocketKV (ICML 2025)
+- **Hardware Compatibility Sources:**
+  - CanItRun Qwen3.6-27B: https://canitrun.dev/models/qwen3.6-27b/
+  - Clore.ai Qwen3.6-27B Guide: https://docs.clore.ai/guides/language-models/qwen36-27b
+  - CobraPhil RTX 5090 Recipe: https://github.com/CobraPhil/qwen36-27b-single-5090
+  - Knightli VRAM Table: https://www.knightli.com/en/2026/05/01/qwen3-6-local-vram-quantization-table/
+  - InsiderLLM Guide: https://insiderllm.com/guides/qwen-3-6-local-ai-guide/
+  - WillItRunAI: https://willitrunai.com/blog/qwen-3-6-27b-vram-requirements
+
+---
+
+## 12. Hardware Kompatibilität: Qwen3.6-27B
+
+### VRAM-Anforderungen (Gewichte nur, 8K Kontext)
+
+| Quantisierung | GGUF-Dateigröße | Min. VRAM | Sichere VRAM | Beste für |
+|--------------|----------------|-----------|-------------|----------|
+| BF16 | 55.6 GB | 64 GB | 80 GB | H100 80GB, Dual-GPU |
+| Q8_0 | 28.6 GB | 32 GB | 40 GB | RTX 5090, A100 40GB |
+| Q6_K | 22.5 GB | 28 GB | 32 GB | RTX 4090, RTX 3090 |
+| Q5_K_M | 19.5 GB | 24 GB | 32 GB | RTX 4090, RTX 3090 |
+| Q4_K_M | 16.8 GB | 20 GB | 24 GB | RTX 4080 16GB (tight), RTX 4090 |
+| Q3_K_M | 13.6 GB | 16 GB | 20 GB | RTX 3080 20GB, RTX 4080 16GB |
+| Q2_K | 11.8 GB | 14 GB | 18 GB | RTX 3080 20GB (comfortable) |
+
+**KV Cache pro Token (27B, 64 heads, head_dim=128):**
+- BF16: ~200 Bytes/token
+- FP8/INT8: ~100 Bytes/token
+- FP4/INT4: ~50 Bytes/token
+- TurboQuant 3bit: ~25-30 Bytes/token
+
+---
+
+### 12.1 2× NVIDIA V100 16GB (32GB total)
+
+**Architektur:** Volta (2017) | **Tensor Cores:** FP16 only (kein natives BF16)
+**Performance:** TF32: ~7.5 TFLOPS, FP16: ~15 TFLOPS pro GPU
+**PCIe:** Gen3 x16 | **NVLink:** ✅ (bis zu 300 GB/s)
+
+| Quantisierung | TP=2 pro GPU | Max. Kontext | Expected TPS | Status |
+|--------------|-------------|-------------|-------------|--------|
+| BF16 | ❌ OOM (27GB > 16GB) | — | — | ❌ |
+| Q8_0 | 14.3 GB | ~32K | ~15-20 tok/s | ⚠️ Tight |
+| Q6_K | 11.25 GB | ~48K | ~18-25 tok/s | ✅ Comfortable |
+| Q4_K_M | 8.4 GB | ~64K | ~20-28 tok/s | ✅ Comfortable |
+| Q3_K_M | 6.8 GB | ~80K | ~22-30 tok/s | ✅ Comfortable |
+
+**Limitationen:**
+- **V100 hat keine BF16 Tensor Cores** — FP16 wird verwendet, was zu Precision-Loss bei 27B Modellen führen kann
+- **KV Cache:** Mit FP8 KV: ~2x mehr Kontext möglich
+- **MTP:** ✅ Funktioniert, aber Volta-Architektur limitiert den Speedup (~1.5-1.8×)
+- **TurboQuant:** ⚠️ Theoretisch möglich, aber Volta-Compute-Capability (7.0) könnte Kernel-Kompatibilitätsprobleme haben
+- **Strict TP:** ✅ vLLM/SGLang unterstützen TP=2 auf V100
+- **Interconnect:** NVLink (SXM2) ideal für TP=2. PCIe-only V100s haben ~15-20% TP-Overhead. Pipeline Parallelism (PP=2) kann besser sein als TP=2 auf PCIe.
+
+**Empfohlene Konfiguration:**
+```bash
+# 2x V100 16GB mit Q6_K und FP8 KV
+vllm serve Lorbus/Qwen3.6-27B-int4-AutoRound \
+  --tensor-parallel-size 2 \
+  --quantization auto_round \
+  --kv-cache-dtype fp8 \
+  --max-model-len 49152 \
+  --dtype float16 \
+  --gpu-memory-utilization 0.90
+```
+
+**Fazit:** V100 16GB ist **borderline** für Qwen3.6-27B. Q6_K mit FP8 KV ist der sweet spot. BF16 ist nicht möglich ohne CPU-Offload.
+
+---
+
+### 12.2 2× NVIDIA RTX 3080 20GB (40GB total)
+
+**Architektur:** Ampere (2020) | **Tensor Cores:** FP16/BF16
+**Performance:** TF32: ~19.8 TFLOPS, FP16: ~39.6 TFLOPS pro GPU
+**PCIe:** Gen4 x16 | **NVLink:** ❌ (PCIe-only)
+
+| Quantisierung | TP=2 pro GPU | Max. Kontext | Expected TPS | Status |
+|--------------|-------------|-------------|-------------|--------|
+| BF16 | ❌ OOM (27GB > 20GB) | — | — | ❌ |
+| Q8_0 | 14.3 GB | ~48K | ~25-35 tok/s | ✅ Comfortable |
+| Q6_K | 11.25 GB | ~64K | ~30-40 tok/s | ✅ Comfortable |
+| Q4_K_M | 8.4 GB | ~80K | ~35-50 tok/s | ✅ Comfortable |
+| Q3_K_M | 6.8 GB | ~128K | ~40-55 tok/s | ✅ Very comfortable |
+
+**Vorteile:**
+- **Ampere hat native BF16** — keine Precision-Loss wie bei V100
+- **FP8 KV Cache:** ✅ vLLM/SGLang unterstützen FP8 KV auf Ampere
+- **MTP:** ✅ Voll unterstützt, guter Speedup mit Ampere Tensor Cores (~1.6-2.0×)
+- **TurboQuant:** ✅ Theoretisch möglich (Compute Capability 8.6)
+- **Strict TP:** ✅ vLLM/SGLang unterstützen TP=2 auf RTX 3080
+
+**Limitationen:**
+- **Kein NVLink** — PCIe-basierte Kommunikation zwischen GPUs (limitiert bei großen KV-Transfers)
+- **BF16 passt nicht** — 27GB pro GPU > 20GB VRAM. Muss quantisiert werden.
+- **Max Kontext bei BF16:** ~16K (27GB weights + KV cache > 20GB)
+- **PCIe TP=2 Overhead:** Consumer Ampere hat ~32 GB/s PCIe Gen4 pro GPU. Für große Batches kann dies MTP-Verifikation bottlenecken. Single-GPU INT4 mit CPU-Offload kann schneller sein als TP=2 bei niedriger Konfiguration.
+
+**Empfohlene Konfiguration:**
+```bash
+# 2x RTX 3080 20GB mit Q6_K und FP8 KV
+vllm serve Lorbus/Qwen3.6-27B-int4-AutoRound \
+  --tensor-parallel-size 2 \
+  --quantization auto_round \
+  --kv-cache-dtype fp8 \
+  --max-model-len 65536 \
+  --dtype bfloat16 \
+  --gpu-memory-utilization 0.92
+```
+
+**Fazit:** RTX 3080 20GB ist **comfortable** für Qwen3.6-27B mit Q6_K/Q4_K_M. FP8 KV ermöglicht ~64K Kontext. MTP funktioniert gut.
+
+---
+
+### 12.3 NVIDIA RTX 5090 32GB (Single GPU)
+
+**Architektur:** Blackwell (2025) | **Tensor Cores:** FP16/BF16/FP4
+**Performance:** TF32: ~24.6 TFLOPS, FP16: ~49.2 TFLOPS, FP4: ~98.4 TFLOPS
+**PCIe:** Gen5 x16 | **NVLink:** ❌ (Single GPU)
+
+| Quantisierung | VRAM Usage | Max. Kontext | Expected TPS | Status |
+|--------------|-----------|-------------|-------------|--------|
+| BF16 | 55.6 GB | ❌ OOM (55.6 > 32) | — | ❌ |
+| Q8_0 | 28.6 GB | ~128K | ~60-90 tok/s | ✅ Comfortable |
+| Q6_K | 22.5 GB | ~160K | ~75-85 tok/s | ✅ Very comfortable |
+| Q4_K_M | 16.8 GB | ~200K | ~80-100 tok/s | ✅ Very comfortable |
+| NVFP4 | 13.5 GB | ~262K | ~132 tok/s | ✅ Production |
+
+**Vorteile:**
+- **Native FP4 Support (NVFP4)** — 4x Kompression bei minimalem PPL-Loss. Blackwell's 5th-gen Tensor Cores beschleunigen FP4-Matrix-Multiplikationen nativ, umgehen Software-Dequantisierung.
+- **Blackwell Tensor Cores** — beste Performance/VRAM-Ratio (~1,792 GB/s BW)
+- **MTP:** ✅ Voll unterstützt, bester Speedup mit Blackwell (~1.8-2.2× mit NVFP4+MTP)
+- **TurboQuant:** ✅ Theoretisch möglich (Compute Capability 9.0)
+- **32GB VRAM** — Q8_0 mit headroom für KV Cache
+
+**Limitationen:**
+- **Single GPU** — kein TP möglich (aber nicht nötig bei 32GB)
+- **BF16 passt nicht** — 55.6GB > 32GB. Muss quantisiert oder CPU-offgeloaded werden.
+- **Max Kontext bei BF16:** ~8K (55.6GB weights + KV > 32GB)
+- **Multi-User Batching:** 32GB VRAM sättigt schnell durch KV-Cache-Wachstum. Prefix-Caching ist stark empfohlen.
+
+**Empfohlene Konfiguration (NVFP4):**
+```bash
+# RTX 5090 32GB mit NVFP4 und MTP
+vllm serve Lorbus/Qwen3.6-27B-int4-AutoRound \
+  --quantization compressed-tensors \
+  --dtype float16 \
+  --max-model-len 262144 \
+  --speculative-config '{"method":"qwen3_next_mtp","num_speculative_tokens":2}' \
+  --gpu-memory-utilization 0.95
+```
+
+**Empfohlene Konfiguration (Q8_0 + FP8 KV):**
+```bash
+# RTX 5090 32GB mit Q8_0 und FP8 KV
+vllm serve Lorbus/Qwen3.6-27B-int4-AutoRound \
+  --quantization auto_round \
+  --kv-cache-dtype fp8 \
+  --max-model-len 131072 \
+  --dtype bfloat16 \
+  --gpu-memory-utilization 0.92
+```
+
+**Fazit:** RTX 5090 32GB ist **ideal** für Qwen3.6-27B. NVFP4 ermöglicht 262K Kontext mit 132+ tok/s. Q8_0 mit FP8 KV bietet ~128K Kontext.
+
+---
+
+### 12.4 Hardware-Vergleichstabelle
+
+| GPU | VRAM | Quantisierung | Max Kontext | Expected TPS | MTP | FP8 KV | TurboQuant | Strict TP |
+|-----|------|--------------|-------------|-------------|-----|--------|------------|-----------|
+| **2× V100 16GB** | 32GB total | Q6_K | ~48K | 18-25 tok/s | ✅ | ✅ | ⚠️ | ✅ TP=2 |
+| **2× RTX 3080 20GB** | 40GB total | Q6_K | ~64K | 30-40 tok/s | ✅ | ✅ | ✅ | ✅ TP=2 |
+| **RTX 5090 32GB** | 32GB | NVFP4 | ~262K | 132 tok/s | ✅ | ✅ | ✅ | ❌ Single |
+| **RTX 5090 32GB** | 32GB | Q8_0 | ~128K | 60-90 tok/s | ✅ | ✅ | ✅ | ❌ Single |
+
+**Empfehlung:**
+- **2× V100 16GB:** Nur mit Q6_K/Q4_K_M + FP8 KV. Volta-Architektur limitiert Performance.
+- **2× RTX 3080 20GB:** Comfortable mit Q6_K/Q4_K_M + FP8 KV. Ampere-Architektur gut für MTP.
+- **RTX 5090 32GB:** Ideal für Qwen3.6-27B. NVFP4 für 262K Kontext, Q8_0 für 128K.
+
+**⚠️ KRITISCH:** BF16 passt auf KEINE der drei Konfigurationen ohne CPU-Offload oder TP.
+- V100 16GB: ❌ (27GB > 16GB pro GPU)
+- RTX 3080 20GB: ❌ (27GB > 20GB pro GPU)
+- RTX 5090 32GB: ❌ (55.6GB > 32GB)
+
+**Für BF16 auf 262K Kontext:** Mindestens 1× A100 80GB oder 2× RTX 4090/3090 mit TP=2.
 
 ---
 
